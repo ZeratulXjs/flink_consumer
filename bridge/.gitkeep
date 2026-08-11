@@ -1,0 +1,2 @@
+# Placeholder — RabbitMQ → Kafka bridge implementation lands here in a follow-up pass.
+# Planned contents: rmq_kafka_bridge.py, bridge-requirements.txt, Dockerfile.bridge

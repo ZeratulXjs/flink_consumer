@@ -1,0 +1,10 @@
+# STUB — to be filled in with the full service layout in a follow-up pass.
+#
+# Planned services (mirroring the driver_trackables_flink reference shape):
+#   postgres, kafka, bridge, jobmanager, taskmanager, submitter
+#
+# See CLAUDE.md for the pipeline architecture this will implement.
+
+version: "3.8"
+
+services: {}
