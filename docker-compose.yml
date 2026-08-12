@@ -1,10 +1,162 @@
-# STUB — to be filled in with the full service layout in a follow-up pass.
-#
-# Planned services (mirroring the driver_trackables_flink reference shape):
-#   postgres, kafka, bridge, jobmanager, taskmanager, submitter
-#
-# See CLAUDE.md for the pipeline architecture this will implement.
+# Local stack: RabbitMQ -> bridge -> Kafka -> PyFlink -> Postgres.
+# See CLAUDE.md for the pipeline architecture and env/.env.example for the
+# config vars each service expects. Copy env/.env.example to env/local.env
+# (untracked) and fill it in before running this stack.
+version: "3.9"
 
-version: "3.8"
+services:
+  postgres:
+    image: postgres:16
+    container_name: session-tracker-postgres
+    restart: unless-stopped
+    env_file:
+      - env/local.env
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/seed_roster.sql:/docker-entrypoint-initdb.d/02_seed_roster.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-services: {}
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: session-tracker-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RMQ_PASSWORD:-guest}
+      RABBITMQ_DEFAULT_VHOST: ${RMQ_VHOST:-/}
+    env_file:
+      - env/local.env
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: session-tracker-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Topics are explicitly provisioned by kafka-init below (different
+      # retention per topic), so auto-create stays off.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: SessionTrackerKRaftCluster01
+    ports:
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: session-tracker-kafka-init
+    restart: "no"
+    env_file:
+      - env/local.env
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic "$${KAFKA_TOPIC}" --partitions 3 --replication-factor 1 \
+          --config retention.ms=3600000
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic "$${KAFKA_DLQ_TOPIC}" --partitions 3 --replication-factor 1 \
+          --config retention.ms=1209600000
+
+  bridge:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile.bridge
+    container_name: session-tracker-bridge
+    restart: unless-stopped
+    env_file:
+      - env/local.env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  jobmanager:
+    build:
+      context: ./flink
+    container_name: session-tracker-jobmanager
+    restart: unless-stopped
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    env_file:
+      - env/local.env
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  taskmanager:
+    build:
+      context: ./flink
+    container_name: session-tracker-taskmanager
+    restart: unless-stopped
+    command: taskmanager
+    env_file:
+      - env/local.env
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    depends_on:
+      - jobmanager
+
+  # One-shot: submits job.py to the already-running cluster, mirroring the
+  # driver_trackables_flink reference's submitter pattern. Waits for the
+  # jobmanager's REST API before submitting since depends_on only waits for
+  # the container to start, not for Flink to actually be ready.
+  submitter:
+    build:
+      context: ./flink
+    container_name: session-tracker-submitter
+    restart: "no"
+    env_file:
+      - env/local.env
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        until curl -sf http://jobmanager:8081/overview > /dev/null; do
+          echo "waiting for jobmanager..."
+          sleep 2
+        done
+        flink run -m jobmanager:8081 -py /opt/flink/usrlib/job.py
+    depends_on:
+      - jobmanager
+      - taskmanager
+
+volumes:
+  postgres-data:
